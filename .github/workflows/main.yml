@@ -11,16 +11,16 @@ on:
         options:
           - none
           - upx
-          - custom
       publish_release:
         description: '发布到 GitHub Release'
         required: true
         default: true
         type: boolean
       release_tag:
-        description: 'Release 标签 (留空则使用日期)'
+        description: 'Release 标签 (留空则自动生成)'
         required: false
         type: string
+
   push:
     tags:
       - 'v*'
@@ -31,7 +31,7 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
-    
+
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
@@ -39,57 +39,76 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    # ========== 1. 编译原始二进制 ==========
+    # ========== 1. 编译（适配 NoCRTtest1.lib）==========
     - name: Build Project (Release x64)
       run: |
-        # 优先尝试 sln/vcxproj，失败则尝试单文件编译
-        $sln = Get-ChildItem -Recurse -Filter "*.sln" | Select-Object -First 1
-        if ($sln) {
-            msbuild "$($sln.FullName)" /p:Configuration=Release /p:Platform=x64 /m
+        $ErrorActionPreference = "Continue"
+
+        Write-Host "========== File Structure =========="
+        Get-ChildItem -Recurse -Include *.sln,*.vcxproj,*.cpp,*.lib,*.h |
+            ForEach-Object { Write-Host $_.FullName }
+        Write-Host "====================================="
+
+        # 尝试 MSBuild
+        Write-Host "`n🔨 Building with MSBuild..."
+        msbuild "ElevatorShellCode.sln" `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=10.0 `
+            /m /v:normal
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "`n⚠️ MSBuild failed, falling back to cl..."
+            cl /EHsc /O2 /GS- /W0 /MT `
+               /Fe:ElevatorShellCode.exe `
+               "ElevatorShellCode\Source.cpp" `
+               /I"ElevatorShellCode" `
+               /link /LIBPATH:"ElevatorShellCode" `
+                     NoCRTtest1.lib `
+                     user32.lib advapi32.lib ntdll.lib kernel32.lib
+            if ($LASTEXITCODE -ne 0) { throw "❌ All compilation methods failed!" }
+            Write-Host "✅ cl fallback succeeded"
         } else {
-            $cpp = Get-ChildItem -Recurse -Filter "*.cpp" | Select-Object -First 1
-            if ($cpp) {
-                cl /EHsc /O2 /Fe:ShellCodeElevator.exe "$($cpp.FullName)" /link user32.lib advapi32.lib ntdll.lib
-            } else {
-                throw "❌ No .sln or .cpp files found!"
-            }
+            Write-Host "✅ MSBuild succeeded"
         }
       shell: pwsh
 
-    - name: Locate Raw Binary
+    - name: Locate Binary
       id: find-binary
       run: |
-        $exe = Get-ChildItem -Recurse -Filter "*.exe" | 
-               Where-Object { $_.DirectoryName -match "Release|x64|bin" } | 
-               Sort-Object LastWriteTime -Descending | 
+        $exe = Get-ChildItem -Recurse -Filter "*.exe" |
+               Where-Object { $_.DirectoryName -match "Release|x64|bin" -or $_.Name -eq "ElevatorShellCode.exe" } |
+               Sort-Object LastWriteTime -Descending |
                Select-Object -First 1
-        if (-not $exe) { throw "❌ Build output not found!" }
+        if (-not $exe) { throw "❌ No executable found after build!" }
         echo "raw_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
         echo "binary_name=$($exe.BaseName)" >> $env:GITHUB_OUTPUT
-        Write-Host "✅ Found: $($exe.FullName) ($([math]::Round($exe.Length/1KB,1)) KB)"
+        Write-Host "✅ Binary: $($exe.FullName) ($([math]::Round($exe.Length/1KB,1)) KB)"
       shell: pwsh
-    - name: Obfuscate - UPX
+
+    # ========== 2. UPX 混淆 ==========
+    - name: Obfuscate with UPX
+      id: upx
       if: ${{ github.event.inputs.obfuscation == 'upx' || (github.event.inputs.obfuscation == '' && startsWith(github.ref, 'refs/tags/')) }}
       run: |
-        choco install upx -y --no-progress | Out-Null
+        $upxVersion = "4.2.4"
+        Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v$upxVersion/upx-$upxVersion-win64.zip" `
+                          -OutFile ".\upx.zip" -UseBasicParsing
+        Expand-Archive -Path ".\upx.zip" -DestinationPath ".\upx-bin" -Force
+        $upxExe = Get-ChildItem ".\upx-bin" -Recurse -Filter "upx.exe" | Select-Object -First 1
+
         New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
         $raw = "${{ steps.find-binary.outputs.raw_path }}"
         $out = ".\obfuscated\${{ steps.find-binary.outputs.binary_name }}_obf.exe"
-        upx --best --lzma -o "$out" "$raw"
-        Write-Host "✅ UPX Obfuscated: $out ($([math]::Round((Get-Item $out).Length/1KB,1)) KB)"
-      shell: pwsh
 
-    - name: Obfuscate - Custom Script
-      if: ${{ github.event.inputs.obfuscation == 'custom' }}
-      run: |
-        New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
-        # ⚠️ 修改为你的自定义混淆脚本路径
-        if (Test-Path ".\scripts\obfuscate.ps1") {
-            & .\scripts\obfuscate.ps1 -Input "${{ steps.find-binary.outputs.raw_path }}" -OutputDir ".\obfuscated"
-        } else {
-            Write-Warning "⚠️ Custom script not found, copying raw binary"
-            Copy-Item "${{ steps.find-binary.outputs.raw_path }}" ".\obfuscated\"
-        }
+        & $upxExe.FullName --best --lzma --force --no-backup -o "$out" "$raw"
+        if (-not (Test-Path $out)) { throw "❌ UPX failed!" }
+
+        $rawSize = [math]::Round((Get-Item $raw).Length / 1KB, 1)
+        $obfSize = [math]::Round((Get-Item $out).Length / 1KB, 1)
+        Write-Host "✅ UPX: ${rawSize}KB → ${obfSize}KB"
+        echo "obf_path=$out" >> $env:GITHUB_OUTPUT
       shell: pwsh
 
     - name: Skip Obfuscation
@@ -99,25 +118,29 @@ jobs:
         Copy-Item "${{ steps.find-binary.outputs.raw_path }}" ".\obfuscated\"
         Write-Host "⏭️ Obfuscation skipped"
       shell: pwsh
+
+    # ========== 3. 确定版本号 ==========
     - name: Determine Version
       id: version
       run: |
         if ("${{ github.event.inputs.release_tag }}" -ne "") {
             $tag = "${{ github.event.inputs.release_tag }}"
         } elseif (startsWith(github.ref, 'refs/tags/')) {
-            $tag = github.ref -replace 'refs/tags/', ''
+            $tag = "${{ github.ref }}" -replace 'refs/tags/', ''
         } else {
             $tag = "dev-" + (Get-Date -Format "yyyyMMdd-HHmmss")
         }
         echo "tag=$tag" >> $env:GITHUB_OUTPUT
-        Write-Host "🏷️ Release Tag: $tag"
+        Write-Host "🏷️ Tag: $tag"
       shell: pwsh
+
+    # ========== 4. 打包并推送到当前项目 Release ==========
     - name: Package Artifact
       run: |
-        $obfFiles = Get-ChildItem ".\obfuscated\*.exe"
-        if (-not $obfFiles) { throw "❌ No obfuscated binary to package!" }
+        $files = Get-ChildItem ".\obfuscated\*.exe"
+        if (-not $files) { throw "❌ No binary in obfuscated folder!" }
         Compress-Archive -Path ".\obfuscated\*" -DestinationPath ".\release.zip" -Force
-        Write-Host "📦 Packaged: release.zip ($([math]::Round((Get-Item .\release.zip).Length/1KB,1)) KB)"
+        Write-Host "📦 Package: release.zip ($([math]::Round((Get-Item .\release.zip).Length/1KB,1)) KB)"
       shell: pwsh
 
     - name: Publish to GitHub Release
@@ -128,19 +151,18 @@ jobs:
         name: "ShellCode Elevator ${{ steps.version.outputs.tag }}"
         files: release.zip
         draft: false
-        prerelease: ${{ contains(steps.version.outputs.tag, '-dev') || contains(steps.version.outputs.tag, '-rc') }}
+        prerelease: ${{ contains(steps.version.outputs.tag, 'dev') }}
         body: |
-          ## 🔧 Automated Obfuscated Build
-          
+          ## 🔧 Automated Build
+
           | Item | Value |
           |------|-------|
           | **Version** | `${{ steps.version.outputs.tag }}` |
           | **Commit** | `${{ github.sha }}` |
           | **Platform** | Windows x64 |
-          | **Obfuscation** | `${{ github.event.inputs.obfuscation || 'upx (tag trigger)' }}` |
+          | **Obfuscation** | `${{ github.event.inputs.obfuscation || 'upx' }}` |
           | **Triggered by** | @${{ github.actor }} |
-          
-          > ⚠️ **DISCLAIMER**: For educational research & authorized security testing only.
-          > Unauthorized access to computer systems is illegal.
+
+          > ⚠️ For educational & authorized testing only.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
