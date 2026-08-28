@@ -1,0 +1,84 @@
+name: Build Obfuscated Release
+
+on:
+  push:
+    tags:
+      - 'v*'  
+
+permissions:
+  contents: write 
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+    - name: Build Project (Release x64)
+      run: msbuild /p:Configuration=Release /p:Platform=x64 /m
+      shell: pwsh
+      
+    - name: Locate Raw Binary
+      id: find-binary
+      run: |
+        $exe = Get-ChildItem -Recurse -Filter "*.exe" | 
+               Where-Object { $_.DirectoryName -match "Release|x64" } | 
+               Select-Object -First 1
+        if (-not $exe) { throw "❌ No release binary found!" }
+        echo "raw_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+        echo "binary_name=$($exe.BaseName)" >> $env:GITHUB_OUTPUT
+        Write-Host "✅ Found: $($exe.FullName) ($([math]::Round($exe.Length/1KB, 1)) KB)"
+      shell: pwsh
+    - name: Obfuscate (.NET ConfuserEx)
+      if: false  
+      run: |
+        dotnet tool install --global Confuser.CLI
+        confuser -o "${{ steps.find-binary.outputs.raw_path }}" `
+                 -conf ".\confuser.crproj" `
+                 -out ".\obfuscated\"
+      shell: pwsh
+    - name: Obfuscate (Native UPX)
+      if: true  
+      run: |
+        choco install upx -y --no-progress
+        $raw = "${{ steps.find-binary.outputs.raw_path }}"
+        $out = ".\obfuscated\${{ steps.find-binary.outputs.binary_name }}_obf.exe"
+        New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
+        upx --best --lzma -o "$out" "$raw"
+        Write-Host "✅ Obfuscated: $out ($([math]::Round((Get-Item $out).Length/1KB, 1)) KB)"
+      shell: pwsh
+    - name: Package Release
+      run: |
+        $obfDir = ".\obfuscated"
+        if (-not (Test-Path "$obfDir\*.exe")) {
+            Write-Warning "⚠️ No obfuscated binary found, falling back to raw binary"
+            Copy-Item "${{ steps.find-binary.outputs.raw_path }}" "$obfDir\"
+        }
+        Compress-Archive -Path "$obfDir\*" -DestinationPath ".\release.zip" -Force
+        Write-Host "📦 Release package created: release.zip"
+      shell: pwsh
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: release.zip
+        name: "ShellCode Elevator ${{ github.ref_name }}"
+        body: |
+          ## 🔧 Automated Obfuscated Build
+          
+          - **Tag**: `${{ github.ref_name }}`
+          - **Commit**: `${{ github.sha }}`
+          - **Platform**: Windows x64
+          - **Obfuscation**: UPX LZMA / ConfuserEx
+          
+          > ⚠️ **DISCLAIMER**: This build is generated automatically for **educational research and authorized security testing only**. 
+          > Do NOT use on systems without explicit written permission. 
+          > The authors assume no liability for misuse.
+        draft: false
+        prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
