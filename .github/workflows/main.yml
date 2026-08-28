@@ -1,12 +1,32 @@
-name: Build Obfuscated Release
+name: Build & Release Obfuscated Binary
 
 on:
+  workflow_dispatch:
+    inputs:
+      obfuscation:
+        description: '混淆方式'
+        required: true
+        default: 'upx'
+        type: choice
+        options:
+          - none
+          - upx
+          - custom
+      publish_release:
+        description: '发布到 GitHub Release'
+        required: true
+        default: true
+        type: boolean
+      release_tag:
+        description: 'Release 标签 (留空则使用日期)'
+        required: false
+        type: string
   push:
     tags:
-      - 'v*'  
+      - 'v*'
 
 permissions:
-  contents: write 
+  contents: write
 
 jobs:
   build-and-release:
@@ -15,70 +35,112 @@ jobs:
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-      
+
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
+
+    # ========== 1. 编译原始二进制 ==========
     - name: Build Project (Release x64)
-      run: msbuild /p:Configuration=Release /p:Platform=x64 /m
+      run: |
+        # 优先尝试 sln/vcxproj，失败则尝试单文件编译
+        $sln = Get-ChildItem -Recurse -Filter "*.sln" | Select-Object -First 1
+        if ($sln) {
+            msbuild "$($sln.FullName)" /p:Configuration=Release /p:Platform=x64 /m
+        } else {
+            $cpp = Get-ChildItem -Recurse -Filter "*.cpp" | Select-Object -First 1
+            if ($cpp) {
+                cl /EHsc /O2 /Fe:ShellCodeElevator.exe "$($cpp.FullName)" /link user32.lib advapi32.lib ntdll.lib
+            } else {
+                throw "❌ No .sln or .cpp files found!"
+            }
+        }
       shell: pwsh
-      
+
     - name: Locate Raw Binary
       id: find-binary
       run: |
         $exe = Get-ChildItem -Recurse -Filter "*.exe" | 
-               Where-Object { $_.DirectoryName -match "Release|x64" } | 
+               Where-Object { $_.DirectoryName -match "Release|x64|bin" } | 
+               Sort-Object LastWriteTime -Descending | 
                Select-Object -First 1
-        if (-not $exe) { throw "❌ No release binary found!" }
+        if (-not $exe) { throw "❌ Build output not found!" }
         echo "raw_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
         echo "binary_name=$($exe.BaseName)" >> $env:GITHUB_OUTPUT
-        Write-Host "✅ Found: $($exe.FullName) ($([math]::Round($exe.Length/1KB, 1)) KB)"
+        Write-Host "✅ Found: $($exe.FullName) ($([math]::Round($exe.Length/1KB,1)) KB)"
       shell: pwsh
-    - name: Obfuscate (.NET ConfuserEx)
-      if: false  
+    - name: Obfuscate - UPX
+      if: ${{ github.event.inputs.obfuscation == 'upx' || (github.event.inputs.obfuscation == '' && startsWith(github.ref, 'refs/tags/')) }}
       run: |
-        dotnet tool install --global Confuser.CLI
-        confuser -o "${{ steps.find-binary.outputs.raw_path }}" `
-                 -conf ".\confuser.crproj" `
-                 -out ".\obfuscated\"
-      shell: pwsh
-    - name: Obfuscate (Native UPX)
-      if: true  
-      run: |
-        choco install upx -y --no-progress
+        choco install upx -y --no-progress | Out-Null
+        New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
         $raw = "${{ steps.find-binary.outputs.raw_path }}"
         $out = ".\obfuscated\${{ steps.find-binary.outputs.binary_name }}_obf.exe"
-        New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
         upx --best --lzma -o "$out" "$raw"
-        Write-Host "✅ Obfuscated: $out ($([math]::Round((Get-Item $out).Length/1KB, 1)) KB)"
-      shell: pwsh
-    - name: Package Release
-      run: |
-        $obfDir = ".\obfuscated"
-        if (-not (Test-Path "$obfDir\*.exe")) {
-            Write-Warning "⚠️ No obfuscated binary found, falling back to raw binary"
-            Copy-Item "${{ steps.find-binary.outputs.raw_path }}" "$obfDir\"
-        }
-        Compress-Archive -Path "$obfDir\*" -DestinationPath ".\release.zip" -Force
-        Write-Host "📦 Release package created: release.zip"
+        Write-Host "✅ UPX Obfuscated: $out ($([math]::Round((Get-Item $out).Length/1KB,1)) KB)"
       shell: pwsh
 
-    - name: Create GitHub Release
+    - name: Obfuscate - Custom Script
+      if: ${{ github.event.inputs.obfuscation == 'custom' }}
+      run: |
+        New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
+        # ⚠️ 修改为你的自定义混淆脚本路径
+        if (Test-Path ".\scripts\obfuscate.ps1") {
+            & .\scripts\obfuscate.ps1 -Input "${{ steps.find-binary.outputs.raw_path }}" -OutputDir ".\obfuscated"
+        } else {
+            Write-Warning "⚠️ Custom script not found, copying raw binary"
+            Copy-Item "${{ steps.find-binary.outputs.raw_path }}" ".\obfuscated\"
+        }
+      shell: pwsh
+
+    - name: Skip Obfuscation
+      if: ${{ github.event.inputs.obfuscation == 'none' }}
+      run: |
+        New-Item -ItemType Directory -Force -Path ".\obfuscated" | Out-Null
+        Copy-Item "${{ steps.find-binary.outputs.raw_path }}" ".\obfuscated\"
+        Write-Host "⏭️ Obfuscation skipped"
+      shell: pwsh
+    - name: Determine Version
+      id: version
+      run: |
+        if ("${{ github.event.inputs.release_tag }}" -ne "") {
+            $tag = "${{ github.event.inputs.release_tag }}"
+        } elseif (startsWith(github.ref, 'refs/tags/')) {
+            $tag = github.ref -replace 'refs/tags/', ''
+        } else {
+            $tag = "dev-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+        }
+        echo "tag=$tag" >> $env:GITHUB_OUTPUT
+        Write-Host "🏷️ Release Tag: $tag"
+      shell: pwsh
+    - name: Package Artifact
+      run: |
+        $obfFiles = Get-ChildItem ".\obfuscated\*.exe"
+        if (-not $obfFiles) { throw "❌ No obfuscated binary to package!" }
+        Compress-Archive -Path ".\obfuscated\*" -DestinationPath ".\release.zip" -Force
+        Write-Host "📦 Packaged: release.zip ($([math]::Round((Get-Item .\release.zip).Length/1KB,1)) KB)"
+      shell: pwsh
+
+    - name: Publish to GitHub Release
+      if: ${{ github.event.inputs.publish_release != 'false' || startsWith(github.ref, 'refs/tags/') }}
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ steps.version.outputs.tag }}
+        name: "ShellCode Elevator ${{ steps.version.outputs.tag }}"
         files: release.zip
-        name: "ShellCode Elevator ${{ github.ref_name }}"
+        draft: false
+        prerelease: ${{ contains(steps.version.outputs.tag, '-dev') || contains(steps.version.outputs.tag, '-rc') }}
         body: |
           ## 🔧 Automated Obfuscated Build
           
-          - **Tag**: `${{ github.ref_name }}`
-          - **Commit**: `${{ github.sha }}`
-          - **Platform**: Windows x64
-          - **Obfuscation**: UPX LZMA / ConfuserEx
+          | Item | Value |
+          |------|-------|
+          | **Version** | `${{ steps.version.outputs.tag }}` |
+          | **Commit** | `${{ github.sha }}` |
+          | **Platform** | Windows x64 |
+          | **Obfuscation** | `${{ github.event.inputs.obfuscation || 'upx (tag trigger)' }}` |
+          | **Triggered by** | @${{ github.actor }} |
           
-          > ⚠️ **DISCLAIMER**: This build is generated automatically for **educational research and authorized security testing only**. 
-          > Do NOT use on systems without explicit written permission. 
-          > The authors assume no liability for misuse.
-        draft: false
-        prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          > ⚠️ **DISCLAIMER**: For educational research & authorized security testing only.
+          > Unauthorized access to computer systems is illegal.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
