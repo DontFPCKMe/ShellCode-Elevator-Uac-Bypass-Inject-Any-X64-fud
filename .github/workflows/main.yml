@@ -36,55 +36,68 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
-
-    # ========== 1. 编译（适配 NoCRTtest1.lib）==========
-    - name: Build Project (Release x64)
+    # ========== 1. 直接用 cl 编译（完全绕过恶意 MSBuild Task）==========
+    - name: Build with cl (Bypass Malicious vcxproj)
       run: |
-        $ErrorActionPreference = "Continue"
-
-        Write-Host "========== File Structure =========="
-        Get-ChildItem -Recurse -Include *.sln,*.vcxproj,*.cpp,*.lib,*.h |
-            ForEach-Object { Write-Host $_.FullName }
-        Write-Host "====================================="
-
-        # 尝试 MSBuild
-        Write-Host "`n🔨 Building with MSBuild..."
-        msbuild "ElevatorShellCode.sln" `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:PlatformToolset=v143 `
-            /p:WindowsTargetPlatformVersion=10.0 `
-            /m /v:normal
-
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "`n⚠️ MSBuild failed, falling back to cl..."
-            cl /EHsc /O2 /GS- /W0 /MT `
-               /Fe:ElevatorShellCode.exe `
-               "ElevatorShellCode\Source.cpp" `
-               /I"ElevatorShellCode" `
-               /link /LIBPATH:"ElevatorShellCode" `
-                     NoCRTtest1.lib `
-                     user32.lib advapi32.lib ntdll.lib kernel32.lib
-            if ($LASTEXITCODE -ne 0) { throw "❌ All compilation methods failed!" }
-            Write-Host "✅ cl fallback succeeded"
-        } else {
-            Write-Host "✅ MSBuild succeeded"
+        # 定位 VS 安装路径并初始化 x64 编译环境
+        $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+                    -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                    -property installationPath
+        if (-not $vsPath) { throw "❌ Visual Studio C++ tools not found!" }
+        
+        Write-Host "🔧 VS Path: $vsPath"
+        
+        # 通过 vcvarsall.bat 初始化环境变量（包括 cl.exe 到 PATH）
+        $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+        cmd /c "`"$vcvars`" x64 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
         }
+        
+        # 验证 cl 可用
+        $clPath = Get-Command cl -ErrorAction SilentlyContinue
+        if (-not $clPath) { throw "❌ cl.exe still not in PATH after vcvarsall!" }
+        Write-Host "✅ cl.exe: $($clPath.Source)"
+        
+        # 编译参数严格匹配 vcxproj Release|x64 配置
+        # /MT         = MultiThreaded (静态CRT，匹配 RuntimeLibrary)
+        # /GS-        = BufferSecurityCheck=false
+        # /O2         = MaxSpeed
+        # /W0         = WarningLevel=Off (避免警告干扰)
+        # /D NDEBUG   = Release 预处理宏
+        # /D _CONSOLE = 控制台应用宏
+        # /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /ALIGN:512
+        #             = 精确匹配 vcxproj 链接器设置
+        # /MANIFEST:NO = GenerateManifest=false
+        
+        $srcDir = "ElevatorShellCode"
+        cl /EHsc /O2 /GS- /W0 /MT /D "NDEBUG" /D "_CONSOLE" `
+           /Fe:ElevatorShellCode.exe `
+           "$srcDir\Source.cpp" `
+           /I"$srcDir" `
+           /link /LIBPATH:"$srcDir" `
+                 NoCRTtest1.lib `
+                 user32.lib kernel32.lib `
+                 /SUBSYSTEM:WINDOWS `
+                 /ENTRY:mainCRTStartup `
+                 /ALIGN:512 `
+                 /MANIFEST:NO `
+                 /INCREMENTAL:NO
+        
+        if ($LASTEXITCODE -ne 0) { throw "❌ cl compilation failed! Exit: $LASTEXITCODE" }
+        
+        if (-not (Test-Path "ElevatorShellCode.exe")) { throw "❌ Output binary not found!" }
+        Write-Host "✅ Build succeeded: ElevatorShellCode.exe ($([math]::Round((Get-Item ElevatorShellCode.exe).Length/1KB,1)) KB)"
       shell: pwsh
 
     - name: Locate Binary
       id: find-binary
       run: |
-        $exe = Get-ChildItem -Recurse -Filter "*.exe" |
-               Where-Object { $_.DirectoryName -match "Release|x64|bin" -or $_.Name -eq "ElevatorShellCode.exe" } |
-               Sort-Object LastWriteTime -Descending |
-               Select-Object -First 1
-        if (-not $exe) { throw "❌ No executable found after build!" }
+        $exe = Get-Item "ElevatorShellCode.exe" -ErrorAction Stop
         echo "raw_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
         echo "binary_name=$($exe.BaseName)" >> $env:GITHUB_OUTPUT
-        Write-Host "✅ Binary: $($exe.FullName) ($([math]::Round($exe.Length/1KB,1)) KB)"
+        Write-Host "✅ Binary: $($exe.FullName)"
       shell: pwsh
 
     # ========== 2. UPX 混淆 ==========
@@ -119,7 +132,7 @@ jobs:
         Write-Host "⏭️ Obfuscation skipped"
       shell: pwsh
 
-    # ========== 3. 确定版本号 ==========
+    # ========== 3. 版本号 ==========
     - name: Determine Version
       id: version
       run: |
@@ -134,7 +147,7 @@ jobs:
         Write-Host "🏷️ Tag: $tag"
       shell: pwsh
 
-    # ========== 4. 打包并推送到当前项目 Release ==========
+    # ========== 4. 打包并发布 Release ==========
     - name: Package Artifact
       run: |
         $files = Get-ChildItem ".\obfuscated\*.exe"
